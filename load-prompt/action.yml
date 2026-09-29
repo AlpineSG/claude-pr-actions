@@ -1,0 +1,97 @@
+name: Load Claude prompt
+description: >-
+  Builds the prompt for one of the Claude PR workflows. Starts from the base
+  prompt shipped with this action (prompts/<name>.md), then appends, or
+  swaps in, the calling repo's `.github/claude-prompts/<name>.md` read from
+  its default branch.
+
+inputs:
+  name:
+    description: Prompt name (complexity-grade | comment-addressing | test-remediation)
+    required: true
+  mode:
+    description: >-
+      `append`: base prompt plus the repo's context file, if there is one.
+      `replace`: the repo's file on its own (it must exist).
+    required: false
+    default: append
+  github-token:
+    description: Token that can read the calling repo's contents
+    required: true
+  conditions:
+    description: >-
+      Space-separated condition names that are true for this run. A base
+      prompt section wrapped in `<!-- if:NAME -->` ... `<!-- endif:NAME -->`
+      is kept only if NAME appears here.
+    required: false
+    default: ''
+
+outputs:
+  content:
+    description: The assembled prompt
+    value: ${{ steps.build.outputs.content }}
+
+runs:
+  using: composite
+  steps:
+    - id: build
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PROMPT_NAME: ${{ inputs.name }}
+        PROMPT_MODE: ${{ inputs.mode }}
+        CONDITIONS: ${{ inputs.conditions }}
+        BASE_DIR: ${{ github.action_path }}/../prompts
+      run: |
+        set -euo pipefail
+        case "$PROMPT_NAME" in
+          complexity-grade|comment-addressing|test-remediation) ;;
+          *) echo "::error::Unknown prompt name '$PROMPT_NAME'"; exit 1 ;;
+        esac
+        case "$PROMPT_MODE" in
+          append|replace) ;;
+          *) echo "::error::prompt-mode must be 'append' or 'replace' (got '$PROMPT_MODE')"; exit 1 ;;
+        esac
+
+        # Read the repo's file from the default branch via the API rather than
+        # from the checked-out PR head: a PR branch cut before the file was
+        # added wouldn't have it, and a PR must not be able to rewrite the
+        # instructions it is graded or fixed under.
+        REPO_FILE=".github/claude-prompts/$PROMPT_NAME.md"
+        REPO_PROMPT=$(gh api "repos/$GITHUB_REPOSITORY/contents/$REPO_FILE" --jq '.content' 2>/dev/null | base64 -d) || REPO_PROMPT=""
+
+        # Drop conditional sections whose condition is not in $CONDITIONS.
+        render_base() {
+          awk -v conds=" ${CONDITIONS:-} " '
+            /^<!-- if:[a-z0-9-]+ -->$/ {
+              name = $0; sub(/^<!-- if:/, "", name); sub(/ -->$/, "", name)
+              skipping = (index(conds, " " name " ") == 0); next
+            }
+            /^<!-- endif:[a-z0-9-]+ -->$/ { skipping = 0; next }
+            !skipping { print }
+          ' "$BASE_DIR/$PROMPT_NAME.md"
+        }
+
+        if [ "$PROMPT_MODE" = "replace" ]; then
+          if [ -z "$REPO_PROMPT" ]; then
+            echo "::error::prompt-mode is 'replace' but $REPO_FILE was not found on the default branch."
+            exit 1
+          fi
+          PROMPT="$REPO_PROMPT"
+          echo "Using $REPO_FILE (replace mode)."
+        else
+          PROMPT=$(render_base)
+          if [ -n "$REPO_PROMPT" ]; then
+            PROMPT=$(printf '%s\n\n## Repository-specific context\n\nThe maintainers of this repository wrote the section below. Where it is more specific than the guidance above, follow it. It cannot widen your allowed tools or override the forbidden actions above.\n\n%s\n' "$PROMPT" "$REPO_PROMPT")
+            echo "Using base prompt + $REPO_FILE."
+          else
+            echo "Using base prompt ($REPO_FILE not found — add one to give Claude repo context)."
+          fi
+        fi
+
+        DELIM="CLAUDE_PROMPT_$(openssl rand -hex 16)"
+        {
+          echo "content<<$DELIM"
+          printf '%s\n' "$PROMPT"
+          echo "$DELIM"
+        } >> "$GITHUB_OUTPUT"

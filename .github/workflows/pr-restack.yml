@@ -1,0 +1,218 @@
+# Reusable workflow: retarget + rebase stacked PRs when their parent merges.
+#
+# When a PR merges, any open PR based on its head branch (a stacked child) is
+# left pointing at a dead base. This workflow:
+#   1. retargets each child to the merged PR's base, and
+#   2. rebases the child onto the new base with `git rebase --onto`, dropping
+#      the parent's commits — required because squash merges rewrite the
+#      parent's history, so a base flip alone leaves the parent's diff
+#      polluting the child PR.
+# Pushes use the automation App token, so the resulting `synchronize` event
+# re-runs CI (and anything triggered by CI) on the restacked child. Rebase
+# conflicts are never force-resolved: the child keeps its old head and gets a
+# comment with the exact commands to finish by hand.
+#
+# Callers own the trigger (pull_request, types: [closed]) and workflow-level
+# concurrency, and need permissions: contents: write, pull-requests: write.
+# Dispatching the conflict sweep additionally requires the automation App to
+# have Actions read/write on the repo. See examples/.
+name: PR Restack — retarget stacked PRs on merge
+
+on:
+  workflow_call:
+    inputs:
+      dispatch-ref:
+        description: >-
+          Branch whose workflow definitions serve dispatched sweeps (`gh
+          workflow run --ref`). Use the integration branch (e.g. main or
+          develop) that carries the sweep-capable comment-addressing workflow.
+        type: string
+        required: true
+      sweep-workflow:
+        description: Workflow file dispatched to sweep leftover threads / fix conflicted restacks
+        type: string
+        required: false
+        default: 'claude-comment-addressing.yml'
+      push-workflow-changes:
+        description: >-
+          Request `workflows: write` on the App token, so pushes whose commits
+          include `.github/workflows/**` changes (e.g. merging or rebasing onto
+          a base that changed workflows) are accepted. The App must have the
+          Workflows permission.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      CLAUDE_APP_ID:
+        required: true
+      CLAUDE_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  restack:
+    name: Retarget + rebase children
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_REPO: ${{ github.repository }}
+      MERGED_PR: ${{ github.event.pull_request.number }}
+      PARENT_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PARENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      NEW_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      DISPATCH_REF: ${{ inputs.dispatch-ref }}
+      SWEEP_WORKFLOW: ${{ inputs.sweep-workflow }}
+    steps:
+      # Mint a token for the automation GitHub App so the base edits and
+      # force-pushes are authored by the App. Pushes made by the App fire
+      # normal pull_request events, which re-runs CI on each child.
+      - name: Mint app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          # Scope the token to what this job needs rather than inheriting
+          # every permission the App installation has.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-actions: write
+          permission-workflows: ${{ inputs.push-workflow-changes && 'write' || '' }}
+
+      - name: Find stacked children
+        id: children
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Open PRs whose base is the branch that just merged. claude-skip
+          # opts a PR out of all automation, including restacking.
+          CHILDREN=$(gh pr list --base "$PARENT_HEAD_REF" --state open \
+            --json number,headRefName,isCrossRepository,labels \
+            --jq '[.[] | select(.labels | map(.name) | index("claude-skip") | not)]')
+          COUNT=$(echo "$CHILDREN" | jq 'length')
+          echo "Found $COUNT stacked child PR(s) based on $PARENT_HEAD_REF"
+          {
+            echo "count=$COUNT"
+            echo "list<<CHILDREN_EOF"
+            echo "$CHILDREN"
+            echo "CHILDREN_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve App bot identity
+        id: bot
+        if: steps.children.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          LOGIN="${APP_SLUG}[bot]"
+          USER_ID=$(gh api "users/$LOGIN" --jq '.id')
+          {
+            echo "login=$LOGIN"
+            echo "email=$USER_ID+$LOGIN@users.noreply.github.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.children.outputs.count != '0'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+          # Credentials must persist: this job pushes. It uploads no artifacts.
+          persist-credentials: true # zizmor: ignore[artipacked]
+
+      - name: Retarget and rebase each child
+        if: steps.children.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CHILDREN: ${{ steps.children.outputs.list }}
+          BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+        run: |
+          set -euo pipefail
+          git config user.name "$BOT_LOGIN"
+          git config user.email "$BOT_EMAIL"
+
+          # The parent branch may be deleted between merge and this run; the
+          # merged PR's head SHA is always reachable via the pull ref, and the
+          # rebase below needs it locally as the exclusion point.
+          git fetch origin "refs/pull/$MERGED_PR/head" "$NEW_BASE_REF"
+
+          # The single-quoted printf formats and GraphQL query hold literal
+          # backticks and $variables on purpose.
+          # shellcheck disable=SC2016
+          restack_child() {
+            local child="$1"
+            local NEEDS_SWEEP=false
+            NUMBER=$(echo "$child" | jq -r '.number')
+            CHILD_REF=$(echo "$child" | jq -r '.headRefName')
+            IS_FORK=$(echo "$child" | jq -r '.isCrossRepository')
+
+            echo "::group::PR #$NUMBER ($CHILD_REF)"
+            # This function runs inside `if !`, which suppresses errexit for
+            # its whole body — critical commands need explicit `|| return 1`
+            # so a failure can't fall through to the rebase/push path.
+            gh pr edit "$NUMBER" --base "$NEW_BASE_REF" || return 1
+
+            if [ "$IS_FORK" = "true" ]; then
+              # Can't push to a fork — retarget only, and hand off the rebase.
+              gh pr comment "$NUMBER" --body "$(printf '<!-- claude:pr-restack -->\n## 🤖 Restacked onto `%s`\n\nParent PR #%s merged, so this PR was retargeted from `%s` to `%s`. This PR comes from a fork, so the branch was **not** rebased — run locally:\n\n```bash\ngit fetch upstream %s\ngit rebase --onto upstream/%s %s\ngit push --force-with-lease\n```' "$NEW_BASE_REF" "$MERGED_PR" "$PARENT_HEAD_REF" "$NEW_BASE_REF" "$NEW_BASE_REF" "$NEW_BASE_REF" "$PARENT_HEAD_SHA")"
+              echo "::endgroup::"
+              return 0
+            fi
+
+            git fetch origin "$CHILD_REF" || return 1
+            git checkout -B "$CHILD_REF" "origin/$CHILD_REF" || return 1
+
+            # Replay only the child's own commits (everything after the
+            # parent's old tip) onto the new base. The parent's content is
+            # already in the base via the merge.
+            if git rebase --onto "origin/$NEW_BASE_REF" "$PARENT_HEAD_SHA"; then
+              if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$CHILD_REF")" ]; then
+                git push --force-with-lease origin "$CHILD_REF" || return 1
+                gh pr comment "$NUMBER" --body "$(printf '<!-- claude:pr-restack -->\n## 🤖 Restacked onto `%s`\n\nParent PR #%s merged. This PR was retargeted from `%s` to `%s` and rebased onto the new base (parent commits dropped). CI is re-running on the rebased head. If you have local work on `%s`, run `git pull --rebase` before pushing.' "$NEW_BASE_REF" "$MERGED_PR" "$PARENT_HEAD_REF" "$NEW_BASE_REF" "$CHILD_REF")"
+              else
+                echo "Rebase was a no-op; nothing to push."
+              fi
+            else
+              git rebase --abort
+              NEEDS_SWEEP=true
+              gh pr comment "$NUMBER" --body "$(printf '<!-- claude:pr-restack -->\n## 🤖 Restack needs a hand — rebase conflict\n\nParent PR #%s merged and this PR was retargeted from `%s` to `%s`, but rebasing onto the new base hit conflicts, so the branch was left untouched. A Claude sweep has been dispatched to attempt the resolution; to finish locally instead:\n\n```bash\ngit fetch origin %s\ngit rebase --onto origin/%s %s %s\n# resolve conflicts, then\ngit push --force-with-lease origin %s\n```' "$MERGED_PR" "$PARENT_HEAD_REF" "$NEW_BASE_REF" "$NEW_BASE_REF" "$NEW_BASE_REF" "$PARENT_HEAD_SHA" "$CHILD_REF" "$CHILD_REF")"
+            fi
+
+            # Dispatch a comment-addressing sweep when there is something for
+            # Claude to act on: a conflicted restack (it fixes mergeability
+            # against the new base), or review threads that survived earlier
+            # comment-triggered runs. Comments themselves already trigger
+            # handling when posted, so this is a leftovers pass, not the
+            # primary path. Dispatch runs count toward the bot round cap.
+            UNRESOLVED=$(gh api graphql \
+              -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved}}}}}' \
+              -f owner="${GH_REPO%/*}" -f repo="${GH_REPO#*/}" -F number="$NUMBER" \
+              --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length') || UNRESOLVED=0
+            if [ "$NEEDS_SWEEP" = "true" ] || [ "$UNRESOLVED" -gt 0 ]; then
+              echo "Dispatching comment sweep for PR #$NUMBER (conflict=$NEEDS_SWEEP, unresolved threads=$UNRESOLVED)"
+              gh workflow run "$SWEEP_WORKFLOW" --ref "$DISPATCH_REF" -f pr_number="$NUMBER" \
+                || echo "::warning::Could not dispatch comment sweep for PR #$NUMBER — the automation App may need Actions read/write permission."
+            fi
+            echo "::endgroup::"
+          }
+
+          # Process every child even if one fails; report the failures at the end.
+          FAILED=""
+          while IFS= read -r child; do
+            if ! restack_child "$child"; then
+              git rebase --abort 2>/dev/null || true
+              FAILED="$FAILED #$(echo "$child" | jq -r '.number')"
+              echo "::warning::Restack failed for PR $(echo "$child" | jq -r '.number') — see log group above."
+            fi
+          done < <(echo "$CHILDREN" | jq -c '.[]')
+
+          if [ -n "$FAILED" ]; then
+            echo "::error::Restack incomplete for:$FAILED"
+            exit 1
+          fi

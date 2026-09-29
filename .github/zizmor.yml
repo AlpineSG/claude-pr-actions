@@ -1,0 +1,8 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # The reusable workflows load prompts from this repo's own
+        # load-prompt action on the same major tag.
+        "AlpineSG/claude-pr-actions/*": ref-pin
+        "*": hash-pin

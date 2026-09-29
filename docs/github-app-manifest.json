@@ -1,0 +1,16 @@
+{
+  "name": "claude-pr-automations",
+  "url": "https://github.com/AlpineSG/claude-pr-actions",
+  "description": "Runs Claude-powered PR automation: complexity grading, comment addressing, test remediation and restacking of stacked PRs.",
+  "public": false,
+  "hook_attributes": { "active": false },
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "actions": "write",
+    "checks": "read"
+  },
+  "default_events": []
+}

@@ -1,0 +1,217 @@
+# Reusable workflow: Claude grades PR risk / complexity.
+#
+# Claude posts one structured comment (the "grade"), applies a complexity-*
+# label, and, if `can-approve` is on, approves LOW/MEDIUM PRs as the GitHub
+# App and dismisses that approval on HIGH.
+#
+# Callers own the triggers and the event gating (draft / fork / dependabot /
+# branch filters), since those differ per repo. One repo might grade on
+# pull_request events directly, another on CI completion (workflow_run).
+# Callers pass the PR coordinates as inputs and need permissions:
+# contents: read, pull-requests: write, issues: write. See examples/.
+name: Claude — PR Complexity Grade
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: PR number from the triggering event; leave empty to resolve from head-sha
+        type: string
+        required: false
+        default: ''
+      head-sha:
+        description: Head SHA the triggering event ran against (staleness guard)
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: 'claude-sonnet-5'
+      max-turns:
+        type: string
+        required: false
+        default: '20'
+      extra-allowed-tools:
+        description: Comma-separated tool entries appended to the shared allow-list
+        type: string
+        required: false
+        default: ''
+      can-approve:
+        description: >-
+          Allow the grader to submit and dismiss the App's own PR review. Off
+          by default, so the grader only labels and comments.
+        type: boolean
+        required: false
+        default: false
+      prompt-mode:
+        description: >-
+          `append` (default): the base prompt shipped with this workflow plus
+          the repo's `.github/claude-prompts/complexity-grade.md`, if there is
+          one. `replace`: the repo's file on its own.
+        type: string
+        required: false
+        default: 'append'
+      telemetry:
+        description: Export OpenTelemetry from the Claude run. Needs `otel-endpoint` as well.
+        type: boolean
+        required: false
+        default: false
+      otel-endpoint:
+        description: OTLP/HTTP endpoint for telemetry (e.g. https://collector.example.com)
+        type: string
+        required: false
+        default: ''
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key. Either this or CLAUDE_CODE_OAUTH_TOKEN is required.
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Claude Code OAuth token, used instead of ANTHROPIC_API_KEY.
+        required: false
+      CLAUDE_APP_ID:
+        required: true
+      CLAUDE_APP_PRIVATE_KEY:
+        required: true
+      OTEL_EXPORTER_OTLP_HEADERS:
+        description: OTLP headers, e.g. `Authorization=Bearer <token>`
+        required: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  grade:
+    name: Grade complexity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: claude-grade-${{ inputs.pr-number || inputs.head-sha }}
+      cancel-in-progress: true
+    steps:
+      - name: Check Claude credentials
+        env:
+          HAS_CREDENTIALS: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_CREDENTIALS" != "true" ]; then
+            echo "::error::Set either the ANTHROPIC_API_KEY or the CLAUDE_CODE_OAUTH_TOKEN secret."
+            exit 1
+          fi
+
+      # Mint a token for the automation GitHub App so labels, comments and
+      # reviews are authored by the App.
+      - name: Mint app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          # Scope the token to what this job needs rather than inheriting
+          # every permission the App installation has.
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER_INPUT: ${{ inputs.pr-number }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+        run: |
+          set -euo pipefail
+          # workflow_run events can carry an empty pull_requests array; fall back to a SHA lookup.
+          PR_NUMBER="$PR_NUMBER_INPUT"
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            PR_NUMBER=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" --jq '.[0].number // empty')
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for SHA $HEAD_SHA — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json headRefOid,labels,state,isDraft)
+          STATE=$(echo "$PR_JSON" | jq -r '.state')
+          IS_DRAFT=$(echo "$PR_JSON" | jq -r '.isDraft')
+          HAS_SKIP=$(echo "$PR_JSON" | jq -r '.labels | map(.name) | index("claude-skip") != null')
+          HEAD_SHA_PR=$(echo "$PR_JSON" | jq -r '.headRefOid')
+
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUMBER is not open (state=$STATE) — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "PR #$PR_NUMBER is a draft — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$HAS_SKIP" = "true" ]; then
+            echo "PR #$PR_NUMBER has claude-skip — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$HEAD_SHA_PR" != "$HEAD_SHA" ]; then
+            echo "Stale: event is for $HEAD_SHA but PR head is $HEAD_SHA_PR. A newer commit will trigger its own grade — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "head_sha=$HEAD_SHA_PR"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+
+      # `persist-credentials: false` stops actions/checkout writing the token
+      # into `.git/config`, where PR-head code could pick it up. This is
+      # defence in depth: the job only runs the Claude action and `gh` calls,
+      # never installs or runs anything from the checked-out tree, so PR-head
+      # code never executes here.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.pr.outputs.skip == 'false'
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Load prompt
+        id: prompt
+        if: steps.pr.outputs.skip == 'false'
+        uses: AlpineSG/claude-pr-actions/load-prompt@v1
+        with:
+          name: complexity-grade
+          mode: ${{ inputs.prompt-mode }}
+          github-token: ${{ steps.app_token.outputs.token }}
+          conditions: ${{ inputs.can-approve && 'can-approve' || 'no-approve' }}
+
+      - name: Run Claude
+        if: steps.pr.outputs.skip == 'false'
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app_token.outputs.token }}
+          # The App is the actor on workflow_runs triggered by its own
+          # auto-fix commits. Let the action's bot guard accept those.
+          allowed_bots: ${{ steps.app_token.outputs.app-slug }}
+          prompt: ${{ steps.prompt.outputs.content }}
+          show_full_output: true
+          claude_args: >-
+            --max-turns ${{ inputs.max-turns }}
+            --model ${{ inputs.model }}
+            --permission-mode bypassPermissions
+            --allowed-tools "Read,Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue edit:*),Bash(gh api:*),Bash(jq:*),Bash(wc:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*)${{ inputs.can-approve && ',Bash(gh pr review:*)' || '' }}${{ inputs.extra-allowed-tools != '' && ',' || '' }}${{ inputs.extra-allowed-tools }}"
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          APP_BOT_LOGIN: ${{ steps.app_token.outputs.app-slug }}[bot]
+          CLAUDE_CODE_ENABLE_TELEMETRY: ${{ inputs.telemetry && inputs.otel-endpoint != '' && '1' || '' }}
+          OTEL_METRICS_EXPORTER: otlp
+          OTEL_LOGS_EXPORTER: otlp
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ inputs.otel-endpoint }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_METRIC_EXPORT_INTERVAL: '10000'
+          OTEL_LOGS_EXPORT_INTERVAL: '2500'
+          OTEL_RESOURCE_ATTRIBUTES: source=github-actions,ci.workflow=complexity-grade,ci.repository=${{ github.repository }}

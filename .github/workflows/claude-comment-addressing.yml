@@ -1,0 +1,421 @@
+# Reusable workflow: Claude addresses PR review comments.
+#
+# Trigger classes (the caller owns the `on:` block — see examples/):
+#  1. Humans: issue_comment / pull_request_review / pull_request_review_comment,
+#     gated on the author having write access (below).
+#  2. A review bot (default CodeRabbit): pull_request_review (submitted)
+#     ONLY, so one bot review means one run rather than one run per inline
+#     comment. Bot-triggered runs are capped via claude-review-round-N labels.
+#  3. A workflow_dispatch sweep: the caller declares the trigger with a
+#     pr_number input and passes it through as `pr-number`. pr-restack
+#     dispatches these after a conflicted restack or when review threads are
+#     left over. Counted as bot-triggered for the round cap, so automated
+#     dispatches stay bounded.
+#
+# Callers MUST define workflow-level concurrency with cancel-in-progress: true.
+# The debounce step relies on newer comments cancelling runs already in
+# flight. Callers need permissions: contents: write, pull-requests: write,
+# issues: write (plus packages: read for a GitHub Packages registry).
+#
+# The concurrency group MUST send bot noise that always skips
+# (bot-authored issue_comment / pull_request_review_comment events, such as a
+# review bot's inline comments or the App's own comments) to a separate group.
+# Concurrency cancellation happens BEFORE job `if`s are evaluated, so in a
+# shared group those runs would cancel the worker in flight and then skip
+# themselves. See examples/.
+name: Claude — Address PR Comments
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: PR number for workflow_dispatch sweeps (pass the caller's inputs.pr_number)
+        type: string
+        required: false
+        default: ''
+      package-manager:
+        description: >-
+          `pnpm`, `npm`, `yarn`, or `none`. Anything other than `none` sets up
+          Node with dependency caching.
+        type: string
+        required: false
+        default: 'pnpm'
+      node-version:
+        type: string
+        required: false
+        default: '24'
+      install:
+        description: >-
+          Install dependencies before the Claude run. 'false' (the default)
+          saves minutes on runs that only reply: the install command is on
+          Claude's allow-list, so it installs only once it edits code.
+        type: string
+        required: false
+        default: 'false'
+      install-command:
+        description: >-
+          Override the install command. Defaults: `pnpm install
+          --frozen-lockfile`, `npm ci`, `yarn install --frozen-lockfile`.
+        type: string
+        required: false
+        default: ''
+      verify-commands:
+        description: >-
+          Comma-separated commands Claude may run to check its edits. Each one
+          becomes a `Bash(<cmd>:*)` allow-list entry. Defaults to lint,
+          type-check and test for the package manager.
+        type: string
+        required: false
+        default: ''
+      registry-url:
+        description: Optional npm registry for setup-node (e.g. https://npm.pkg.github.com)
+        type: string
+        required: false
+        default: ''
+      registry-scope:
+        description: Optional package scope for `registry-url` (e.g. @my-org)
+        type: string
+        required: false
+        default: ''
+      extra-allowed-tools:
+        description: Comma-separated tool entries appended to the shared allow-list
+        type: string
+        required: false
+        default: ''
+      review-bot-login:
+        description: >-
+          Login of an AI review bot whose review submissions trigger a
+          round-capped run. Empty turns bot-triggered runs off.
+        type: string
+        required: false
+        default: 'coderabbitai[bot]'
+      bot-round-cap:
+        description: Max bot-triggered / dispatched runs per PR before claude-review-max is applied
+        type: number
+        required: false
+        default: 3
+      model:
+        type: string
+        required: false
+        default: 'claude-opus-5-5'
+      max-turns:
+        type: string
+        required: false
+        default: '24'
+      prompt-mode:
+        description: >-
+          `append` (default): the base prompt plus the repo's
+          `.github/claude-prompts/comment-addressing.md`, if there is one.
+          `replace`: the repo's file on its own.
+        type: string
+        required: false
+        default: 'append'
+      telemetry:
+        description: Export OpenTelemetry from the Claude run. Needs `otel-endpoint` as well.
+        type: boolean
+        required: false
+        default: false
+      otel-endpoint:
+        description: OTLP/HTTP endpoint for telemetry
+        type: string
+        required: false
+        default: ''
+      push-workflow-changes:
+        description: >-
+          Request `workflows: write` on the App token, so pushes whose commits
+          include `.github/workflows/**` changes (e.g. merging or rebasing onto
+          a base that changed workflows) are accepted. The App must have the
+          Workflows permission.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key. Either this or CLAUDE_CODE_OAUTH_TOKEN is required.
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Claude Code OAuth token, used instead of ANTHROPIC_API_KEY.
+        required: false
+      CLAUDE_APP_ID:
+        required: true
+      CLAUDE_APP_PRIVATE_KEY:
+        required: true
+      NPM_REGISTRY_TOKEN:
+        description: >-
+          Token for `registry-url`. If it is not set and `registry-url` is set,
+          GITHUB_TOKEN is used (right for GitHub Packages).
+        required: false
+      OTEL_EXPORTER_OTLP_HEADERS:
+        description: OTLP headers, e.g. `Authorization=Bearer <token>`
+        required: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  address:
+    name: Address comments
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Every other bot, including this App, stays excluded. That, plus the
+    # round cap, is the loop protection for auto-fix pushes.
+    if: >-
+      (
+        github.event.sender.type != 'Bot'
+        && github.actor != 'github-actions[bot]'
+        && (
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+          || github.event_name == 'pull_request_review_comment'
+          || github.event_name == 'pull_request_review'
+        )
+      ) || (
+        github.event_name == 'pull_request_review'
+        && inputs.review-bot-login != ''
+        && github.event.sender.login == inputs.review-bot-login
+      ) || github.event_name == 'workflow_dispatch'
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}
+      BOT_TRIGGER: ${{ (inputs.review-bot-login != '' && github.event.sender.login == inputs.review-bot-login) || github.event_name == 'workflow_dispatch' }}
+      BOT_ROUND_CAP: ${{ inputs.bot-round-cap }}
+      REVIEW_BOT_LOGIN: ${{ inputs.review-bot-login }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_REGISTRY_TOKEN || (inputs.registry-url != '' && secrets.GITHUB_TOKEN) || '' }}
+      NPM_TOKEN: ${{ secrets.NPM_REGISTRY_TOKEN || (inputs.registry-url != '' && secrets.GITHUB_TOKEN) || '' }}
+    steps:
+      - name: Check Claude credentials
+        env:
+          HAS_CREDENTIALS: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_CREDENTIALS" != "true" ]; then
+            echo "::error::Set either the ANTHROPIC_API_KEY or the CLAUDE_CODE_OAUTH_TOKEN secret."
+            exit 1
+          fi
+      - name: Debounce — wait for adjacent comments to coalesce
+        run: |
+          # Newer comments inside this window cancel this run through the
+          # caller's concurrency group (cancel-in-progress). The run that
+          # survives handles all unresolved threads in one Claude pass.
+          sleep 60
+      # Mint a token for the automation GitHub App so commits and gh CLI
+      # actions are authored by the App rather than github-actions[bot].
+      # Commits pushed with an App token fire normal pull_request events,
+      # which downstream workflow_run triggers (e.g. CI) need in order to fire
+      # on auto-fix pushes.
+      - name: Mint app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          # Scope the token to what this job needs rather than inheriting
+          # every permission the App installation has.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: ${{ inputs.push-workflow-changes && 'write' || '' }}
+      # Author write-access gate for the HUMAN trigger path. `issue_comment` /
+      # `pull_request_review` triggers expose privileged tokens no matter who
+      # triggered them, and this job later checks out the PR head. So refuse
+      # to go on unless the comment author has write access. Bot-triggered
+      # runs skip this check: review-bot reviews and workflow_dispatch sweeps
+      # are bounded by the round cap below, dispatching already needs write
+      # access, and fork PRs are skipped in the gate step either way.
+      - name: Require author write access
+        if: env.BOT_TRIGGER != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          REPO_FULL_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PERM=$(gh api "repos/$REPO_FULL_NAME/collaborators/$SENDER_LOGIN/permission" --jq '.permission' 2>/dev/null || echo "none")
+          case "$PERM" in
+            admin|write|maintain)
+              echo "Sender $SENDER_LOGIN has $PERM access — proceeding."
+              ;;
+            *)
+              echo "Sender $SENDER_LOGIN lacks write access (permission=$PERM) — refusing to run."
+              exit 1
+              ;;
+          esac
+      - name: Resolve PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          REPO_FULL_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,headRepository,baseRefName,labels,state)
+          HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
+          BASE_REF=$(echo "$PR_JSON" | jq -r '.baseRefName')
+          STATE=$(echo "$PR_JSON" | jq -r '.state')
+          IS_FORK=$(echo "$PR_JSON" | jq -r --arg repo "$REPO_FULL_NAME" '.headRepository.nameWithOwner != $repo')
+          HAS_SKIP=$(echo "$PR_JSON" | jq -r '.labels | map(.name) | index("claude-skip") != null')
+          HAS_ROUND_MAX=$(echo "$PR_JSON" | jq -r '.labels | map(.name) | index("claude-review-max") != null')
+
+          # Bot-triggered rounds are counted via claude-review-round-N labels.
+          ROUND=$(echo "$PR_JSON" | jq '[.labels[].name | capture("^claude-review-round-(?<n>[0-9]+)$").n | tonumber] | max // 0')
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "head_ref=$HEAD_REF"
+            echo "head_sha=$HEAD_SHA"
+            echo "base_ref=$BASE_REF"
+            echo "state=$STATE"
+            echo "is_fork=$IS_FORK"
+            echo "has_skip=$HAS_SKIP"
+            echo "has_round_max=$HAS_ROUND_MAX"
+            echo "next_round=$((ROUND + 1))"
+          } >> "$GITHUB_OUTPUT"
+      - name: Gate — fork, opt-out, closed PR, bot round cap
+        id: gate
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_STATE: ${{ steps.pr.outputs.state }}
+          IS_FORK: ${{ steps.pr.outputs.is_fork }}
+          HAS_SKIP: ${{ steps.pr.outputs.has_skip }}
+          HAS_ROUND_MAX: ${{ steps.pr.outputs.has_round_max }}
+          NEXT_ROUND: ${{ steps.pr.outputs.next_round }}
+        run: |
+          set -euo pipefail
+          skip() { echo "Skipping: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          [ "$PR_STATE" = "OPEN" ] || skip "PR is not open"
+          [ "$IS_FORK" = "false" ] || skip "PR is from a fork"
+          [ "$HAS_SKIP" = "false" ] || skip "claude-skip label present"
+
+          if [ "$BOT_TRIGGER" = "true" ]; then
+            [ "$HAS_ROUND_MAX" = "false" ] || skip "claude-review-max label present"
+            if [ "$NEXT_ROUND" -gt "$BOT_ROUND_CAP" ]; then
+              gh pr edit "$PR_NUMBER" --add-label "claude-review-max"
+              gh pr comment "$PR_NUMBER" --body $'<!-- claude:comment-addressing -->\n## 🤖 Comment addressing — bot round cap reached\n\nAutomated runs (review-bot reviews and dispatched sweeps) have hit the round cap, so the `claude-review-max` label has been applied. Human comments still trigger runs. Remove the label to turn bot-triggered runs back on.'
+              skip "bot round cap reached"
+            fi
+            # Count this bot-triggered round.
+            gh pr edit "$PR_NUMBER" --add-label "claude-review-round-$NEXT_ROUND"
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - name: Resolve App bot identity
+        id: bot
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          LOGIN="${APP_SLUG}[bot]"
+          USER_ID=$(gh api "users/$LOGIN" --jq '.id')
+          {
+            echo "login=$LOGIN"
+            echo "email=$USER_ID+$LOGIN@users.noreply.github.com"
+          } >> "$GITHUB_OUTPUT"
+      - name: Checkout PR head
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+          # Credentials must persist: this job pushes. It uploads no artifacts.
+          persist-credentials: true # zizmor: ignore[artipacked]
+      - name: Configure git identity
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+        run: |
+          git config user.name "$BOT_LOGIN"
+          git config user.email "$BOT_EMAIL"
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: steps.gate.outputs.skip == 'false' && inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.gate.outputs.skip == 'false' && inputs.package-manager != 'none'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          registry-url: ${{ inputs.registry-url }}
+          scope: ${{ inputs.registry-scope }}
+      - name: Resolve toolchain commands
+        id: tools
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          INSTALL_COMMAND_INPUT: ${{ inputs.install-command }}
+          VERIFY_COMMANDS_INPUT: ${{ inputs.verify-commands }}
+        run: |
+          set -euo pipefail
+          # INSTALL_TOOLS is broader than INSTALL so Claude can regenerate a
+          # lockfile (non-frozen install) after resolving a merge conflict.
+          case "$PACKAGE_MANAGER" in
+            pnpm) INSTALL="pnpm install --frozen-lockfile"; INSTALL_TOOLS="pnpm install"; VERIFY="pnpm lint,pnpm type-check,pnpm test" ;;
+            npm)  INSTALL="npm ci"; INSTALL_TOOLS="npm ci,npm install"; VERIFY="npm run lint,npm run type-check,npm test" ;;
+            yarn) INSTALL="yarn install --frozen-lockfile"; INSTALL_TOOLS="yarn install"; VERIFY="yarn lint,yarn type-check,yarn test" ;;
+            none) INSTALL=""; INSTALL_TOOLS=""; VERIFY="" ;;
+            *) echo "::error::package-manager must be pnpm, npm, yarn or none (got '$PACKAGE_MANAGER')"; exit 1 ;;
+          esac
+          if [ -n "$INSTALL_COMMAND_INPUT" ]; then
+            INSTALL="$INSTALL_COMMAND_INPUT"
+            INSTALL_TOOLS="$INSTALL_COMMAND_INPUT${INSTALL_TOOLS:+,}$INSTALL_TOOLS"
+          fi
+          VERIFY="${VERIFY_COMMANDS_INPUT:-$VERIFY}"
+
+          TOOLS=""
+          IFS=',' read -ra CMDS <<< "$INSTALL_TOOLS,$VERIFY"
+          for cmd in ${CMDS[@]+"${CMDS[@]}"}; do
+            cmd="$(printf '%s' "$cmd" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+            if [ -n "$cmd" ]; then TOOLS="$TOOLS,Bash($cmd:*)"; fi
+          done
+          {
+            echo "install=$INSTALL"
+            echo "verify=$VERIFY"
+            echo "allowed=$TOOLS"
+          } >> "$GITHUB_OUTPUT"
+      # Eager install is opt-in (`install: 'true'`). Most triggers turn out to
+      # be reply-only or no-ops, and installing up front costs minutes a run.
+      - name: Install deps
+        if: steps.gate.outputs.skip == 'false' && inputs.install == 'true' && steps.tools.outputs.install != ''
+        env:
+          INSTALL_COMMAND: ${{ steps.tools.outputs.install }}
+        run: eval "$INSTALL_COMMAND"
+      - name: Load prompt
+        id: prompt
+        if: steps.gate.outputs.skip == 'false'
+        uses: AlpineSG/claude-pr-actions/load-prompt@v1
+        with:
+          name: comment-addressing
+          mode: ${{ inputs.prompt-mode }}
+          github-token: ${{ steps.app_token.outputs.token }}
+      - name: Run Claude
+        if: steps.gate.outputs.skip == 'false'
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app_token.outputs.token }}
+          # Review-bot submissions are a supported trigger. The App itself is
+          # allow-listed so the other Claude workflows behave the same way.
+          # (The action strips a trailing `[bot]` when it matches.)
+          allowed_bots: ${{ steps.app_token.outputs.app-slug }}${{ inputs.review-bot-login != '' && format(',{0}', inputs.review-bot-login) || '' }}
+          prompt: ${{ steps.prompt.outputs.content }}
+          show_full_output: true
+          claude_args: >-
+            --max-turns ${{ inputs.max-turns }}
+            --model ${{ inputs.model }}
+            --permission-mode bypassPermissions
+            --allowed-tools "Read,Edit${{ steps.tools.outputs.allowed }},Bash(git:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh issue edit:*),Bash(gh api:*),Bash(jq:*),Bash(wc:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*)${{ inputs.extra-allowed-tools != '' && ',' || '' }}${{ inputs.extra-allowed-tools }}"
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          APP_BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          INSTALL_COMMAND: ${{ steps.tools.outputs.install }}
+          VERIFY_COMMANDS: ${{ steps.tools.outputs.verify }}
+          CLAUDE_CODE_ENABLE_TELEMETRY: ${{ inputs.telemetry && inputs.otel-endpoint != '' && '1' || '' }}
+          OTEL_METRICS_EXPORTER: otlp
+          OTEL_LOGS_EXPORTER: otlp
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ inputs.otel-endpoint }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_METRIC_EXPORT_INTERVAL: '10000'
+          OTEL_LOGS_EXPORT_INTERVAL: '2500'
+          OTEL_RESOURCE_ATTRIBUTES: source=github-actions,ci.workflow=comment-addressing,ci.repository=${{ github.repository }}

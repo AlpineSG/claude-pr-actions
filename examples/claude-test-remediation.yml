@@ -1,0 +1,26 @@
+# Copy to .github/workflows/claude-test-remediation.yml in your repo.
+# `workflows` must match the `name:` of your CI workflow.
+name: Claude — Test Remediation
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+  issues: write
+  # packages: read   # only if you install from GitHub Packages
+
+jobs:
+  remediate:
+    uses: AlpineSG/claude-pr-actions/.github/workflows/claude-test-remediation.yml@v1
+    with:
+      standard-base-refs: 'main|develop'
+      # If your tests need a database:
+      # postgres-image: postgres:17
+      # database-url: postgres://postgres:postgres@localhost:5432/app_test
+    secrets: inherit

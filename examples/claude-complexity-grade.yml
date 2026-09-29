@@ -1,0 +1,31 @@
+# Copy to .github/workflows/claude-complexity-grade.yml in your repo.
+#
+# Grades each PR once, after CI passes. `workflows` must match the `name:` of
+# your CI workflow. To grade on every push instead, trigger on pull_request
+# (types: [opened, synchronize, ready_for_review]) and pass
+# github.event.pull_request.number / .head.sha.
+name: Claude — PR Complexity Grade
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  grade:
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.actor.login != 'dependabot[bot]'
+    uses: AlpineSG/claude-pr-actions/.github/workflows/claude-complexity-grade.yml@v1
+    with:
+      pr-number: ${{ github.event.workflow_run.pull_requests[0].number }}
+      head-sha: ${{ github.event.workflow_run.head_sha }}
+      # can-approve: true   # let the App approve LOW/MEDIUM PRs
+    secrets: inherit

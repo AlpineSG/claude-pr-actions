@@ -1,0 +1,454 @@
+# Reusable workflow: Claude fixes failing CI on PRs.
+#
+# Callers own the trigger (workflow_run on CI, types: [completed]) and need
+# permissions: contents: write, pull-requests: write, actions: read,
+# checks: read, issues: write (plus packages: read for a GitHub Packages
+# registry). See examples/.
+#
+# Repos whose test suites need a database pass `postgres-image` (and usually
+# `database-url`). Repos that don't need one leave both unset.
+name: Claude — Test Remediation
+
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: >-
+          `pnpm`, `npm`, `yarn`, or `none`. Anything other than `none` sets up
+          Node with dependency caching.
+        type: string
+        required: false
+        default: 'pnpm'
+      node-version:
+        type: string
+        required: false
+        default: '24'
+      install-command:
+        description: >-
+          Override the install command. Defaults: `pnpm install
+          --frozen-lockfile`, `npm ci`, `yarn install --frozen-lockfile`.
+        type: string
+        required: false
+        default: ''
+      verify-commands:
+        description: >-
+          Comma-separated commands Claude may run to reproduce and check a
+          fix. Each one becomes a `Bash(<cmd>:*)` allow-list entry. Defaults
+          to lint, type-check and test for the package manager.
+        type: string
+        required: false
+        default: ''
+      registry-url:
+        description: Optional npm registry for setup-node (e.g. https://npm.pkg.github.com)
+        type: string
+        required: false
+        default: ''
+      registry-scope:
+        description: Optional package scope for `registry-url` (e.g. @my-org)
+        type: string
+        required: false
+        default: ''
+      postgres-image:
+        description: Postgres service image (e.g. `postgres:17`). Empty means no Postgres service.
+        type: string
+        required: false
+        default: ''
+      postgres-user:
+        type: string
+        required: false
+        default: 'postgres'
+      postgres-password:
+        description: Password for the throwaway CI database (not a secret)
+        type: string
+        required: false
+        default: 'postgres'
+      postgres-db:
+        type: string
+        required: false
+        default: 'app_test'
+      database-url:
+        description: DATABASE_URL exported to the Claude run (throwaway CI credentials, not a secret)
+        type: string
+        required: false
+        default: ''
+      extra-allowed-tools:
+        description: Comma-separated tool entries appended to the shared allow-list
+        type: string
+        required: false
+        default: ''
+      standard-base-refs:
+        description: >-
+          Pipe-separated glob list of standard base branches. PRs based on any
+          other branch count as stacked and get no automated Claude spend.
+          Their failures show up once the stack is retargeted.
+        type: string
+        required: false
+        default: 'main|master|develop|release/*|hotfix/*'
+      attempt-cap:
+        description: Max remediation attempts per PR before claude-attempt-max is applied
+        type: number
+        required: false
+        default: 3
+      ci-log-tail-lines:
+        description: How many trailing lines of the failed-step log Claude gets
+        type: number
+        required: false
+        default: 2000
+      model:
+        type: string
+        required: false
+        default: 'claude-opus-5-5'
+      max-turns:
+        type: string
+        required: false
+        default: '32'
+      prompt-mode:
+        description: >-
+          `append` (default): the base prompt plus the repo's
+          `.github/claude-prompts/test-remediation.md`, if there is one.
+          `replace`: the repo's file on its own.
+        type: string
+        required: false
+        default: 'append'
+      telemetry:
+        description: Export OpenTelemetry from the Claude run. Needs `otel-endpoint` as well.
+        type: boolean
+        required: false
+        default: false
+      otel-endpoint:
+        description: OTLP/HTTP endpoint for telemetry
+        type: string
+        required: false
+        default: ''
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key. Either this or CLAUDE_CODE_OAUTH_TOKEN is required.
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Claude Code OAuth token, used instead of ANTHROPIC_API_KEY.
+        required: false
+      CLAUDE_APP_ID:
+        required: true
+      CLAUDE_APP_PRIVATE_KEY:
+        required: true
+      NPM_REGISTRY_TOKEN:
+        description: >-
+          Token for `registry-url`. If it is not set and `registry-url` is set,
+          GITHUB_TOKEN is used (right for GitHub Packages).
+        required: false
+      OTEL_EXPORTER_OTLP_HEADERS:
+        description: OTLP headers, e.g. `Authorization=Bearer <token>`
+        required: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  remediate:
+    name: Remediate test failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.actor.login != 'dependabot[bot]'
+    env:
+      ATTEMPT_CAP: ${{ inputs.attempt-cap }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_REGISTRY_TOKEN || (inputs.registry-url != '' && secrets.GITHUB_TOKEN) || '' }}
+      NPM_TOKEN: ${{ secrets.NPM_REGISTRY_TOKEN || (inputs.registry-url != '' && secrets.GITHUB_TOKEN) || '' }}
+    services:
+      # If the image string is empty the runner skips the service entirely,
+      # so repos with no database just leave `postgres-image` unset.
+      postgres:
+        # The caller picks the image. Pin a digest there (postgres:17@sha256:...) for full reproducibility.
+        image: ${{ inputs.postgres-image }} # zizmor: ignore[unpinned-images]
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ${{ inputs.postgres-user }} -d ${{ inputs.postgres-db }}"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    concurrency:
+      group: claude-remediate-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      - name: Check Claude credentials
+        env:
+          HAS_CREDENTIALS: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_CREDENTIALS" != "true" ]; then
+            echo "::error::Set either the ANTHROPIC_API_KEY or the CLAUDE_CODE_OAUTH_TOKEN secret."
+            exit 1
+          fi
+      # Mint a token for the automation GitHub App so commits and gh CLI
+      # actions are authored by the App rather than github-actions[bot].
+      # Commits pushed with an App token fire normal pull_request events, so
+      # CI re-runs on the auto-fix push (and so does anything triggered by
+      # CI, such as complexity grading). Branch protection needs that re-run
+      # to see the post-fix CI status in the PR's check rollup.
+      - name: Mint app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          # Scope the token to what this job needs rather than inheriting
+          # every permission the App installation has.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-actions: read
+          permission-checks: read
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER_EVENT: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          STANDARD_BASE_REFS: ${{ inputs.standard-base-refs }}
+        run: |
+          set -euo pipefail
+          # The pull_requests array on workflow_run can be empty for some events; fall back to a SHA lookup.
+          PR_NUMBER="$PR_NUMBER_EVENT"
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            PR_NUMBER=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" --jq '.[0].number // empty')
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for SHA $HEAD_SHA — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,headRepository,baseRefName,labels,number,state)
+          STATE=$(echo "$PR_JSON" | jq -r '.state')
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUMBER is not open (state=$STATE) — exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only PRs on a standard base get remediation (see the
+          # standard-base-refs input for why).
+          BASE_REF=$(echo "$PR_JSON" | jq -r '.baseRefName')
+          IS_STANDARD=false
+          IFS='|' read -ra BASE_PATTERNS <<< "$STANDARD_BASE_REFS"
+          for pattern in "${BASE_PATTERNS[@]}"; do
+            # shellcheck disable=SC2254 # unquoted on purpose: patterns are globs (release/*)
+            case "$BASE_REF" in
+              $pattern) IS_STANDARD=true ;;
+            esac
+          done
+          if [ "$IS_STANDARD" != "true" ]; then
+            echo "PR #$PR_NUMBER is stacked (base=$BASE_REF) — remediation skipped."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IS_FORK=$(echo "$PR_JSON" | jq -r --arg repo "$GITHUB_REPOSITORY" '.headRepository.nameWithOwner != $repo')
+          HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+          HEAD_SHA_PR=$(echo "$PR_JSON" | jq -r '.headRefOid')
+          HAS_SKIP=$(echo "$PR_JSON" | jq -r '.labels | map(.name) | index("claude-skip") != null')
+          HAS_MAX=$(echo "$PR_JSON" | jq -r '.labels | map(.name) | index("claude-attempt-max") != null')
+
+          # Work out the current attempt count from the claude-attempt-N labels.
+          ATTEMPT=$(echo "$PR_JSON" | jq '[.labels[].name | capture("^claude-attempt-(?<n>[0-9]+)$").n | tonumber] | max // 0')
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "head_ref=$HEAD_REF"
+            echo "base_ref=$BASE_REF"
+            echo "head_sha=$HEAD_SHA_PR"
+            echo "is_fork=$IS_FORK"
+            echo "has_skip=$HAS_SKIP"
+            echo "has_max=$HAS_MAX"
+            echo "next_attempt=$((ATTEMPT + 1))"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip if fork, opted-out, or capped
+        id: gate
+        if: steps.pr.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          IS_FORK: ${{ steps.pr.outputs.is_fork }}
+          HAS_SKIP: ${{ steps.pr.outputs.has_skip }}
+          HAS_MAX: ${{ steps.pr.outputs.has_max }}
+          NEXT_ATTEMPT: ${{ steps.pr.outputs.next_attempt }}
+        run: |
+          set -euo pipefail
+          skip() { echo "Skipping: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          [ "$IS_FORK" = "false" ] || skip "PR is from a fork"
+          [ "$HAS_SKIP" = "false" ] || skip "claude-skip label present"
+          [ "$HAS_MAX" = "false" ] || skip "claude-attempt-max label present"
+          if [ "$NEXT_ATTEMPT" -gt "$ATTEMPT_CAP" ]; then
+            gh pr edit "$PR_NUMBER" --add-label "claude-attempt-max"
+            gh pr comment "$PR_NUMBER" --body $'<!-- claude:test-remediation -->\n## 🤖 Test remediation — attempt cap reached\n\nThe `claude-attempt-max` label has been applied, and no more automated remediation will run on this PR. A human needs to look into it.'
+            skip "attempt cap reached"
+          fi
+          gh pr edit "$PR_NUMBER" --add-label "claude-attempt-$NEXT_ATTEMPT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Download CI failure logs
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          TAIL_LINES: ${{ inputs.ci-log-tail-lines }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/claude
+          # --log-failed prints only the failed steps. Keep the tail, where
+          # the relevant stack trace usually is, so the prompt stays a sane size.
+          gh run view "$RUN_ID" --log-failed > /tmp/claude/ci-failure-full.log || true
+          tail -n "$TAIL_LINES" /tmp/claude/ci-failure-full.log > /tmp/claude/ci-failure.log
+          echo "Failure log size:"
+          wc -l /tmp/claude/ci-failure.log
+
+      - name: Resolve App bot identity
+        id: bot
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          LOGIN="${APP_SLUG}[bot]"
+          USER_ID=$(gh api "users/$LOGIN" --jq '.id')
+          {
+            echo "login=$LOGIN"
+            echo "email=$USER_ID+$LOGIN@users.noreply.github.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+          # Credentials must persist: this job pushes. It uploads no artifacts.
+          persist-credentials: true # zizmor: ignore[artipacked]
+
+      - name: Configure git identity
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        env:
+          BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+        run: |
+          git config user.name "$BOT_LOGIN"
+          git config user.email "$BOT_EMAIL"
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false' && inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false' && inputs.package-manager != 'none'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          registry-url: ${{ inputs.registry-url }}
+          scope: ${{ inputs.registry-scope }}
+      - name: Resolve toolchain commands
+        id: tools
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          INSTALL_COMMAND_INPUT: ${{ inputs.install-command }}
+          VERIFY_COMMANDS_INPUT: ${{ inputs.verify-commands }}
+        run: |
+          set -euo pipefail
+          # INSTALL_TOOLS is broader than INSTALL so Claude can regenerate a
+          # lockfile (non-frozen install) after resolving a merge conflict.
+          case "$PACKAGE_MANAGER" in
+            pnpm) INSTALL="pnpm install --frozen-lockfile"; INSTALL_TOOLS="pnpm install"; VERIFY="pnpm lint,pnpm type-check,pnpm test" ;;
+            npm)  INSTALL="npm ci"; INSTALL_TOOLS="npm ci,npm install"; VERIFY="npm run lint,npm run type-check,npm test" ;;
+            yarn) INSTALL="yarn install --frozen-lockfile"; INSTALL_TOOLS="yarn install"; VERIFY="yarn lint,yarn type-check,yarn test" ;;
+            none) INSTALL=""; INSTALL_TOOLS=""; VERIFY="" ;;
+            *) echo "::error::package-manager must be pnpm, npm, yarn or none (got '$PACKAGE_MANAGER')"; exit 1 ;;
+          esac
+          if [ -n "$INSTALL_COMMAND_INPUT" ]; then
+            INSTALL="$INSTALL_COMMAND_INPUT"
+            INSTALL_TOOLS="$INSTALL_COMMAND_INPUT${INSTALL_TOOLS:+,}$INSTALL_TOOLS"
+          fi
+          VERIFY="${VERIFY_COMMANDS_INPUT:-$VERIFY}"
+
+          TOOLS=""
+          IFS=',' read -ra CMDS <<< "$INSTALL_TOOLS,$VERIFY"
+          for cmd in ${CMDS[@]+"${CMDS[@]}"}; do
+            cmd="$(printf '%s' "$cmd" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+            if [ -n "$cmd" ]; then TOOLS="$TOOLS,Bash($cmd:*)"; fi
+          done
+          {
+            echo "install=$INSTALL"
+            echo "verify=$VERIFY"
+            echo "allowed=$TOOLS"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install deps
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false' && steps.tools.outputs.install != ''
+        env:
+          INSTALL_COMMAND: ${{ steps.tools.outputs.install }}
+        run: eval "$INSTALL_COMMAND"
+
+      # Exported via GITHUB_ENV rather than step env so repos with no
+      # database get no DATABASE_URL at all (set-but-empty can trip env
+      # validation).
+      - name: Export DATABASE_URL
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false' && inputs.database-url != ''
+        env:
+          DATABASE_URL_INPUT: ${{ inputs.database-url }}
+        run: echo "DATABASE_URL=$DATABASE_URL_INPUT" >> "$GITHUB_ENV"
+
+      - name: Load prompt
+        id: prompt
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        uses: AlpineSG/claude-pr-actions/load-prompt@v1
+        with:
+          name: test-remediation
+          mode: ${{ inputs.prompt-mode }}
+          github-token: ${{ steps.app_token.outputs.token }}
+
+      - name: Run Claude
+        if: steps.pr.outputs.skip == 'false' && steps.gate.outputs.skip == 'false'
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1.0.165
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app_token.outputs.token }}
+          # The App is the actor on workflow_runs triggered by its own
+          # auto-fix commits. Let the action's bot guard accept those (the
+          # claude-attempt-N labels above are the loop protection).
+          allowed_bots: ${{ steps.app_token.outputs.app-slug }}
+          prompt: ${{ steps.prompt.outputs.content }}
+          show_full_output: true
+          claude_args: >-
+            --max-turns ${{ inputs.max-turns }}
+            --model ${{ inputs.model }}
+            --permission-mode bypassPermissions
+            --allowed-tools "Read,Edit${{ steps.tools.outputs.allowed }},Bash(git:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh issue edit:*),Bash(gh run view:*),Bash(gh api:*),Bash(jq:*),Bash(wc:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(awk:*),Bash(sed:*)${{ inputs.extra-allowed-tools != '' && ',' || '' }}${{ inputs.extra-allowed-tools }}"
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          ATTEMPT: ${{ steps.pr.outputs.next_attempt }}
+          APP_BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          INSTALL_COMMAND: ${{ steps.tools.outputs.install }}
+          VERIFY_COMMANDS: ${{ steps.tools.outputs.verify }}
+          CI_FAILURE_LOG_PATH: /tmp/claude/ci-failure.log
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          CLAUDE_CODE_ENABLE_TELEMETRY: ${{ inputs.telemetry && inputs.otel-endpoint != '' && '1' || '' }}
+          OTEL_METRICS_EXPORTER: otlp
+          OTEL_LOGS_EXPORTER: otlp
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ inputs.otel-endpoint }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_METRIC_EXPORT_INTERVAL: '10000'
+          OTEL_LOGS_EXPORT_INTERVAL: '2500'
+          OTEL_RESOURCE_ATTRIBUTES: source=github-actions,ci.workflow=test-remediation,ci.repository=${{ github.repository }}
