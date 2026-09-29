@@ -168,7 +168,7 @@ jobs:
       # defence in depth: the job only runs the Claude action and `gh` calls,
       # never installs or runs anything from the checked-out tree, so PR-head
       # code never executes here.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.pr.outputs.skip == 'false'
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
